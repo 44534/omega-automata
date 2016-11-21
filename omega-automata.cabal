@@ -5,7 +5,7 @@ name:                omega-automata
 version:             0.1.1.0
 synopsis:            A module for processing omega automata
 -- description:
-homepage:            
+homepage:            https://github.com/44534/omega-automata
 license:             GPL-3
 license-file:        LICENSE
 author:              Clara Waldmann
