@@ -10,18 +10,37 @@ module OmegaAutomata.Hoa ( AliasName
                          , HeaderItem(..)
                          , EdgeItem(..)
                          , BodyItem(..)
+                         , HOA() , header, body, addProps
                          , parseHoa
                          , toHoa
-                         , nbaToHoa
-                         , hoaToNBA) where
+                         , nbaToHoa, dpaToHoa, draToHoa
+                         , hoaToNBA, hoaToDRA, hoaToDPA
+                        ) where
 import qualified OmegaAutomata.Automata as A
 import qualified Data.Text as T
-import Data.Attoparsec.Text
+import Data.Attoparsec.Text hiding (string, decimal)
+import qualified Data.Attoparsec.Text as DAT
 import Data.Attoparsec.Expr
 import Control.Applicative
 import Control.Monad.State as SM
 import Data.List (intersperse)
 import qualified Data.Set as S
+import Data.List
+import qualified Data.Map as M
+import Data.Maybe
+
+
+data HOA = HOA [HeaderItem] [BodyItem]
+  deriving Show
+
+header :: HOA -> [HeaderItem]
+header (HOA hs bs) = hs
+
+body :: HOA -> [BodyItem]
+body (HOA hs bs) = bs
+
+addProps :: [HeaderItem ] -> HOA -> HOA
+addProps ps (HOA hs bs) = HOA (hs ++ ps) bs
 
 type AliasName = T.Text
 
@@ -108,18 +127,19 @@ instance MBoolExpr HoaAccCond where
   _or = AccOr
   _true = AccBoolExpr True
   _false = AccBoolExpr False
-
+  
 -- | The actual parser
 --   Returns a tuple of headeritems and bodyitems
-parseHoa :: Parser ([HeaderItem], [BodyItem])
+parseHoa :: Parser HOA 
 parseHoa = do
+  whitespace
   parseAttribute "HOA"
-  string "v1"
+  token "v1"
   (hs, (i, as)) <- runStateT (many parseHeaderItem) (0, [])
-  skipNonToken $ string "--BODY--"
+  token "--BODY--"
   bs <- many $ parseBodyItem i as
-  skipNonToken $ string "--END--"
-  return (hs, bs)
+  token "--END--"
+  return $ HOA hs bs
 
 
 hoaToEdges :: [BodyItem] -> [(A.State, Maybe LabelExpr, A.State)]
@@ -139,22 +159,166 @@ hoaToStartStates hs = concat [qs | Start qs <- hs]
 
 
 -- | Convert parsed Hoa to NBA.
-hoaToNBA :: ([HeaderItem], [BodyItem])
+hoaToNBA :: HOA 
          -> A.NBA A.State (Maybe LabelExpr) (Maybe LabelExpr)
-hoaToNBA (hs, bs) = let qs = hoaToStates bs
-                        ts = hoaToEdges bs
-                        ss = hoaToStartStates hs
-                        as = [q | BodyItem _ q _ (Just _) _ <- bs] in
-                          A.makeNBA qs ts ss as
+hoaToNBA (HOA hs bs) =
+  let aps = concat [aps | AP aps <- hs]
+      qs = hoaToStates bs
+      ts = hoaToEdges bs
+      ss = hoaToStartStates hs
+      as = [q | BodyItem _ q _ (Just _) _ <- bs]
+  in
+
+      (A.makeNBA qs ts ss as) { A.aps = Just $ aps }
+
+      
+buchitoparity :: [(A.State, Maybe LabelExpr)] -> HOA -> A.ParityAccept A.State
+buchitoparity qs (HOA hs bs) =
+    let infs = [q | BodyItem _ q _ (Just _) _ <- bs]
+        parmap = M.fromList $
+            map (\(q,_) -> (q, if q `elem` infs then 0 else 1 ))
+            $ qs
+    in A.MinEv parmap
+      
+paracc :: MinMax -> EvenOdd -> Int -> HOA -> A.ParityAccept A.State
+paracc mm eo i (HOA hs bs) = 
+     let accn = case (mm,eo) of
+                            (Max, Even) -> A.MaxEv
+                            (Max, Odd) -> A.MaxOdd
+                            (Min, Even) -> A.MinEv
+                            (Min, Odd) -> A.MinOdd
+     in  accn $ M.fromList $ do
+            BodyItem _ q _ (Just [i]) _ <- bs
+            return (q, i)
+
+rabin1toparity :: HOA -> A.ParityAccept A.State
+rabin1toparity (HOA hs bs) =
+    let [(accl, accr)] = [(accl, accr) | Acceptance (2, AccAnd accl accr)  <- hs ]
+        fin = case (accl, accr) of
+                   (FinCond 0, InfCond 1) -> 0
+                   (FinCond 1, InfCond 0) -> 1
+                   (InfCond 0, FinCond 1) -> 1
+                   (InfCond 1, FinCond 0) -> 0
+        topar f mi = case mi of
+                          Nothing -> 0
+                          Just [i] -> if i == f then 2 else 1
+    in A.MaxOdd $ M.fromList $ do
+            BodyItem _ q _ mi _ <- bs
+            return (q, topar fin mi)
+            
+alltoparity :: HOA -> A.ParityAccept A.State
+alltoparity (HOA _ bs) = A.MaxEv $ M.fromList $ zip [q | BodyItem _ q _ _ _ <- bs] (repeat 0)
+            
+nonetoparity :: HOA -> A.ParityAccept A.State
+nonetoparity (HOA _ bs) = A.MaxEv $ M.fromList $ zip [q | BodyItem _ q _ _ _ <- bs] (repeat 1)
+            
+hoaToDPA :: HOA 
+    -> Either [AccName] (A.DPA A.State (Maybe LabelExpr) (Maybe LabelExpr))
+hoaToDPA h@(HOA hs bs) = 
+   let  aps = concat [aps | AP aps <- hs]
+        qs = hoaToStates bs
+        ts = hoaToLabeledEdges (length aps) bs
+        ss = hoaToStartStates hs
+        [accn] = [ accn | AcceptanceName accn <- hs ]
+   in case accn of
+        Parity mm eo i -> Right 
+            (A.makeAutomat qs ts ss (paracc mm eo i h)) 
+            { A.aps = Just $ aps } 
+        Buchi -> Right 
+            (A.makeAutomat qs ts ss (buchitoparity qs h)) 
+            { A.aps = Just $ aps } 
+        Rabin 1 -> Right 
+            (A.makeAutomat qs ts ss (rabin1toparity h)) 
+            { A.aps = Just $ aps } 
+        All -> Right 
+            (A.makeAutomat qs ts ss (alltoparity h)) 
+            { A.aps = Just $ aps } 
+        None -> Right 
+            (A.makeAutomat qs ts ss (nonetoparity h)) 
+            { A.aps = Just $ aps } 
+        _ -> Left [acc | AcceptanceName acc <- hs]
+             
+formToRab :: HoaAccCond -> [(Int, Int)]
+formToRab (AccBoolExpr False) = []
+formToRab (AccAnd (FinCond i) (InfCond j)) = [(i,j)]
+formToRab (AccOr l r) = formToRab l ++ formToRab r
+
+bitvOfLength :: Int -> [[LabelExpr -> LabelExpr]]
+bitvOfLength naps = 
+    reverse <$> (sequence $ replicate naps [LNot, id])
+    
+apInFormula :: Int -> LabelExpr -> Bool
+apInFormula ap (RefAP i) = ap == i
+apInFormula _ (LBoolExpr _) = False
+apInFormula ap (LNot expr) = apInFormula ap expr
+apInFormula ap (LAnd ex1 ex2) = apInFormula ap ex1 || apInFormula ap ex2
+apInFormula ap (LOr ex1 ex2) = apInFormula ap ex1 || apInFormula ap ex2
+
+    
+expandFormula :: Int -> LabelExpr -> [LabelExpr]
+expandFormula naps (LBoolExpr True) = do
+    fs <- bitvOfLength naps
+    return $ foldl1 LAnd
+                $ zipWith ( \f i -> f $ RefAP i ) fs [0..]
+    
+expandFormula naps f = do
+    let unfix = filter (\i -> not $ apInFormula i f) [0..naps-1]
+    fs <- bitvOfLength $ length unfix
+    let expr = foldl' LAnd f
+                $ zipWith ( \f i -> f $ RefAP i ) fs unfix
+    return expr
+    
+expandEdges :: Int ->  A.State ->  [EdgeItem]
+            -> [(A.State, Maybe LabelExpr, A.State)]
+expandEdges naps q es | all (isJust . edgeLabel) es  = do
+    e <- es
+    fs <- return $ edgeLabel e  
+    q' <- stateConj e
+    return (q, fs, q')
+expandEdges naps q es | all (isNothing . edgeLabel) es  = do
+        (e,fs) <- zip es $ bitvOfLength naps
+        q' <- stateConj e
+        let exp = foldl1 LAnd
+                $ zipWith ( \f i -> f $ RefAP i ) fs [0..]
+        return (q, Just exp, q')
+  
+
+hoaToLabeledEdges :: Int -> [BodyItem]
+                  -> [(A.State, Maybe LabelExpr, A.State)]
+hoaToLabeledEdges 0 bs = do
+    BodyItem _ q _ _ es <- bs
+    EdgeItem _ sc _ <- es
+    q' <- sc
+    return (q, Just $ LBoolExpr True , q')
+    
+hoaToLabeledEdges naps bs =
+  bs >>= \b -> expandEdges naps (num b) (edges b)
+
+hoaToDRA :: HOA 
+         -> A.DRA A.State (Maybe LabelExpr) (Maybe LabelExpr)
+hoaToDRA (HOA hs bs) =
+  let aps = concat [aps | AP aps <- hs]
+      qs = hoaToStates bs
+      ts = hoaToLabeledEdges (length aps) bs
+      ss = hoaToStartStates hs
+      smap = M.fromListWith S.union $ do
+          BodyItem _ q _ (Just is) _ <- bs
+          i <- is
+          return (i, S.singleton q)
+      [f] = [f | Acceptance (_, f) <- hs]
+      acc = map (\(i,j) -> (fromMaybe S.empty $ M.lookup i smap, fromMaybe S.empty $ M.lookup j smap)) $ formToRab f 
+  in
+      (A.makeAutomat qs ts ss acc) { A.aps = Just aps }
+
 
 
 parseBodyItem :: Int -> [AliasName] -> Parser BodyItem
 parseBodyItem i as = do
-  skipNonToken $ parseAttribute "State"
-  l <- skipNonToken $ option Nothing $ Just <$> brackets (parseLabelExpr i as)
-  n <- skipNonToken $ decimal
-  d <- skipNonToken $ option Nothing $ Just <$> parseDoubleQuotedString
-  a <- skipNonToken $ option Nothing $ Just <$> parseAccSig
+  parseAttribute "State"
+  l <- option Nothing $ Just <$> brackets (parseLabelExpr i as)
+  n <- decimal
+  d <- option Nothing $ Just <$> parseDoubleQuotedString
+  a <- option Nothing $ Just <$> parseAccSig
   es <- many $ parseEdgeItem i as
   return BodyItem
          { stateLabel = l
@@ -167,9 +331,9 @@ parseBodyItem i as = do
 
 parseEdgeItem :: Int -> [AliasName] -> Parser EdgeItem
 parseEdgeItem i as = do
-  l <- skipNonToken $ option Nothing $ Just <$> brackets (parseLabelExpr i as)
-  s <- skipNonToken $ parseConjunction decimal
-  a <- skipNonToken $ option Nothing $ Just <$> parseAccSig
+  l <- option Nothing $ Just <$> brackets (parseLabelExpr i as)
+  s <- parseConjunction decimal
+  a <- option Nothing $ Just <$> parseAccSig
   return EdgeItem
          { edgeLabel = l
          , stateConj = s
@@ -178,21 +342,20 @@ parseEdgeItem i as = do
 
 
 parseAccSig :: Parser [Int]
-parseAccSig = curls $ parseSpaceSeparated decimal
+parseAccSig = curls $ many decimal
 
 
 parseAttribute :: T.Text -> Parser ()
 parseAttribute a = do
-  skipNonToken $ string a
-  skipNonToken $ string ":"
-  skipNonToken $ return ()
+  token a
+  token ":"
+  return ()
 
 
 parseProperties :: Parser HeaderItem
 parseProperties = do
   parseAttribute "properties"
-  skipNonToken $ return ()
-  Properties <$> (parseSpaceSeparated parseIdentifier)
+  Properties <$> many parseIdentifier <* whitespace
 
 
 parseHeaderItem :: SM.StateT (Int, [AliasName]) Parser HeaderItem
@@ -201,7 +364,6 @@ parseHeaderItem = do
   r <- choice $ lift <$> [parseAccName,
                           parseAP,
                           parseStart,
-                          parseAccName,
                           parseNumStates,
                           parseHoaAccCond,
                           parseProperties,
@@ -230,19 +392,17 @@ parseName = do
 parseStart :: Parser HeaderItem
 parseStart = do
   parseAttribute "Start"
-  Start <$> decimal `sepBy1` skipNonToken "&"
+  Start <$> decimal `sepBy1` token "&"
 
 
 parseTool :: Parser HeaderItem
 parseTool = do
   parseAttribute "tool"
-  Tool <$> (parseSpaceSeparated parseDoubleQuotedString)
+  Tool <$> many parseDoubleQuotedString
 
 
 parseAliasName :: Parser AliasName
-parseAliasName = do
-  char '@'
-  parseIdentifier
+parseAliasName = char '@' *> parseIdentifier <* whitespace
 
 
 parseAlias :: Int -> [AliasName] -> Parser HeaderItem
@@ -250,7 +410,6 @@ parseAlias i as = do
   parseAttribute "Alias"
   a <- parseAliasName
   guard (not (a `elem` as)) <?> "Duplicate definition of aliases."
-  skipSpace
   expr <- parseLabelExpr i as
   return $ Alias (a, expr)
 
@@ -266,27 +425,27 @@ parseAccName :: Parser HeaderItem
 parseAccName = do
   parseAttribute "acc-name"
   (AcceptanceName <$>
-   ((string "Buchi" >> return Buchi) <|>
-   (string "co-Buchi" >> return CoBuchi) <|>
-   (string "all" >> return All) <|>
-   (string "none" >> return None) <|>
-   (GBuchi <$> (string "generalized-Buchi" >> skipNonToken decimal)) <|>
-   (GCoBuchi <$> (string "generalized-co-Buchi" >> skipNonToken decimal)) <|>
-   (Streett <$> (string "Streett" >> skipNonToken decimal)) <|>
-   (Rabin <$> (string "Rabin" >> skipNonToken decimal)) <|>
+   ((token "Buchi" >> return Buchi) <|>
+   (token "co-Buchi" >> return CoBuchi) <|>
+   (token "all" >> return All) <|>
+   (token "none" >> return None) <|>
+   (GBuchi <$> (token "generalized-Buchi" >> decimal)) <|>
+   (GCoBuchi <$> (token "generalized-co-Buchi" >> decimal)) <|>
+   (Streett <$> (token "Streett" >> decimal)) <|>
+   (Rabin <$> (token "Rabin" >> decimal)) <|>
    parseParityName <|>
    parseGRabinName))
 
 
 parseParityName :: Parser AccName
 parseParityName = do
-  string "parity"
+  token "parity"
   skipSpace
-  min_max <- (string "min" >> return Min) <|>
-             (string "max" >> return Max)
+  min_max <- (token "min" >> return Min) <|>
+             (token "max" >> return Max)
   skipSpace
-  even_odd <- (string "even" >> return Even) <|>
-              (string "odd" >> return Odd)
+  even_odd <- (token "even" >> return Even) <|>
+              (token "odd" >> return Odd)
   skipSpace
   n <- decimal
   return (Parity min_max even_odd n)
@@ -294,7 +453,7 @@ parseParityName = do
 
 parseGRabinName :: Parser AccName
 parseGRabinName = do
-  string "generalized-Rabin"
+  token "generalized-Rabin"
   skipSpace
   n <- decimal
   nums <- count n decimal
@@ -303,14 +462,14 @@ parseGRabinName = do
 
 parseLabelExpr :: Int -> [AliasName] -> Parser LabelExpr
 parseLabelExpr i as = parseMBoolExpr p boolOps where
-  p = RefAP <$> skipNonToken (parseIntInRange i) <|>
-      RefAlias <$> skipNonToken (parseRefAlias as)
+  p = RefAP <$> parseIntInRange i <|>
+      RefAlias <$> parseRefAlias as
 
 
 parseHoaAccCond :: Parser HeaderItem
 parseHoaAccCond = do
   parseAttribute "Acceptance"
-  i <- skipNonToken decimal
+  i <- decimal
   acc <- parseAccCond i
   return (Acceptance (i, acc)) where
     parseAccCond i = parseMBoolExpr (p i) monotonicBoolOps
@@ -318,11 +477,11 @@ parseHoaAccCond = do
           parseInf i <|>
           parseCompFin i<|>
           parseCompInf i
-    parseAcc str p' = skipNonToken (string str) >> parens p'
+    parseAcc str p' = (token str) >> parens p'
     parseFin i = parseAcc "Fin" (FinCond <$> parseIntInRange i)
     parseInf i = parseAcc "Inf" (InfCond <$> parseIntInRange i)
-    parseCompFin i = parseAcc "Fin" (string "!" >> (FinCond <$> parseIntInRange i))
-    parseCompInf i = parseAcc "Inf" (string "!" >> (InfCond <$> parseIntInRange i))
+    parseCompFin i = parseAcc "Fin" (token "!" >> (CompFinCond <$> parseIntInRange i))
+    parseCompInf i = parseAcc "Inf" (token "!" >> (CompInfCond <$> parseIntInRange i))
 
 
 parseAP :: Parser HeaderItem
@@ -334,43 +493,46 @@ parseAP = do
 
 
 parseIdentifier :: Parser T.Text
-parseIdentifier = takeWhile1 (inClass "0-9a-zA-Z_-")
+parseIdentifier = takeWhile1 (inClass "0-9a-zA-Z_-") <* (DAT.takeWhile (inClass " \t"))
 
 
-parseSpaceSeparated :: Parser a -> Parser [a]
-parseSpaceSeparated p = p `sepBy1` many (string " ")
+-- | replace with "many1"
+-- parseSpaceSeparated :: Parser a -> Parser [a]
+-- parseSpaceSeparated p = p `sepBy1` many (DAT.string " ")
 
 
 parseConjunction :: Parser a -> Parser [a]
-parseConjunction p = p `sepBy1` skipNonToken (string "&")
+parseConjunction p = p `sepBy1` (token "&")
 
 
 monotonicBoolOps :: MBoolExpr a => [[Operator T.Text a]]
-monotonicBoolOps = [[Infix (skipNonToken (string "|") >> return _or) AssocLeft]
-                   ,[Infix (skipNonToken (string "&") >> return _and) AssocLeft]
+monotonicBoolOps = [[Infix ((token "&") >> return _and) AssocLeft]
+                   ,[Infix ((token "|") >> return _or) AssocLeft]
                    ]
 
 
 boolOps :: BoolExpr a => [[Operator T.Text a]]
-boolOps = [[Prefix (skipNonToken (string "!") >> return _not)]] ++ monotonicBoolOps
+boolOps = [[Prefix ((token "!") >> return _not)]] ++ monotonicBoolOps
 
 
 parseMBoolExpr :: (MBoolExpr a) => Parser a -> [[Operator T.Text a]] -> Parser a
 parseMBoolExpr p ops = buildExpressionParser ops term where
-  term = (skipNonToken (string "t") >> return _true) <|>
-         (skipNonToken (string "f") >> return _false) <|>
+  term = ((token "t") >> return _true) <|>
+         ((token "f") >> return _false) <|>
          parens (parseMBoolExpr p ops) <|>
          p
 
 -- | Convert NBA into HOA format
-nbaToHoa :: (Show q, Show l, Ord q) => A.NBA q (Maybe LabelExpr) l
-                                    -> ([HeaderItem], [BodyItem])
+nbaToHoa :: (Show q, Show l, Ord q)
+   => A.NBA q (Maybe LabelExpr) l
+   -> HOA
 nbaToHoa a = let
   hs = [ NumStates $ S.size (A.states a)
        , Acceptance (1, InfCond 0)
        , Start $ [(A.toNode a q) - 1 | q <- S.toList (A.start a)]
        , Tool ["ldba-tool"]
        , AcceptanceName Buchi
+       , AP $ fromJust $  A.aps a
        ]
   bs = [BodyItem{ stateLabel = Nothing
                 , num = (A.toNode a q) - 1
@@ -382,12 +544,119 @@ nbaToHoa a = let
                                    } | (q', l) <- A.succs a q]
                 }
          | q <- S.toList (A.states a), let isAcc = S.member q (A.accept a)]
-  in (hs, bs)
+  in HOA hs bs
 
+-- ACHTUNG: verschieden für maxev , minodd, ...
+buildDPAacceptance :: A.ParityAccept q -> Int -> HoaAccCond
+buildDPAacceptance acc nr =
+    let fininfs = zipWith ($) (concat $ repeat [FinCond,InfCond]) [0..nr]
+        inffins = zipWith ($) (concat $ repeat [InfCond,FinCond]) [0..nr]
+    in case acc of
+            A.MaxEv m -> buildmax AccAnd AccOr (head inffins) (tail inffins)
+            A.MaxOdd m -> buildmax AccOr AccAnd (head fininfs) (tail fininfs)
+            A.MinEv m -> buildmin AccOr AccAnd (head inffins) (tail inffins)
+            A.MinOdd m -> buildmin AccAnd AccOr (head fininfs) (tail fininfs)
+  
+buildmin :: (HoaAccCond -> HoaAccCond -> HoaAccCond ) 
+    -> (HoaAccCond -> HoaAccCond -> HoaAccCond ) 
+    -> HoaAccCond -> [HoaAccCond] -> HoaAccCond
+buildmin _ _ x [] = x
+buildmin op1 _ x [y] = op1 x y
+buildmin op1 op2 x (y:z:zs) = op1 x $ op2 y $ buildmin op1 op2 z zs
+  
+buildmax :: (HoaAccCond -> HoaAccCond -> HoaAccCond ) 
+    -> (HoaAccCond -> HoaAccCond -> HoaAccCond ) 
+    -> HoaAccCond -> [HoaAccCond] -> HoaAccCond
+buildmax _ _ x [] = x
+buildmax op1 _ x [y] = op1 x y
+buildmax op1 op2 x (y:z:zs) = buildmax op1 op2 ( op2 (op1 x y) z) zs
 
+  
+tomapmaxpar :: A.ParityAccept q -> (M.Map q Int , Int) 
+tomapmaxpar ac = case ac of
+                 A.MaxEv m -> (m, maximum $ M.elems m)
+                 A.MaxOdd m -> (m, maximum $ M.elems m)
+                 A.MinEv m -> (m, maximum $ M.elems m)
+                 A.MinOdd m -> (m, maximum $ M.elems m)
+  
+toaccname :: A.ParityAccept q -> AccName
+toaccname pac = case pac of
+                 A.MaxEv m -> Parity Max Even $ 1 + (maximum $ M.elems m)
+                 A.MaxOdd m -> Parity Max Odd $ 1 + (maximum $ M.elems m)
+                 A.MinEv m -> Parity Min Even $ 1 + (maximum $ M.elems m)
+                 A.MinOdd m -> Parity Min Odd $ 1 + (maximum $ M.elems m)
+      
+  
+dpaToHoa :: (Show q, Show l, Ord q) => A.DPA q (Maybe LabelExpr) l
+                                    -> HOA
+dpaToHoa a = 
+    let (parmap, maxp) = tomapmaxpar $ A.accept a  
+        hs = [ NumStates $ S.size (A.states a)
+             , Start $ [(A.toNode a q) - 1 | q <- S.toList (A.start a)]
+             , Tool ["optimized IAR", "v1"]
+             , AcceptanceName $ toaccname $ A.accept a
+             , Acceptance ( maxp + 1, buildDPAacceptance (A.accept a) maxp)
+             , AP $ fromJust $  A.aps a
+             ]
+        bs = [BodyItem{ stateLabel = Nothing
+                , num = (A.toNode a q) - 1
+                , descr = Nothing
+                , stateAccSig = case M.lookup q parmap of
+                                     Just p -> Just [p]
+                                     Nothing -> Nothing
+                , edges = [EdgeItem{ edgeLabel = l
+                                   , stateConj = [(A.toNode a q') - 1]
+                                   , accSig = Nothing
+                                   } | (q', l) <- A.succs a q]
+                }
+         | q <- S.toList (A.states a)]
+    in HOA hs bs
+  
+
+buildDRAacceptance :: Int -> HeaderItem
+buildDRAacceptance 0 = Acceptance (0, AccBoolExpr False)
+buildDRAacceptance 1 = Acceptance (2, AccAnd (FinCond 0) (InfCond 1))
+buildDRAacceptance n = 
+    let Acceptance (_, accpre) = buildDRAacceptance (n-1)
+    in Acceptance (2*n, AccOr accpre $ AccAnd (FinCond $ 2*(n-1)) (InfCond $ 2*(n-1)+1) )
+  
+inacc :: Ord q => q -> [A.Rabinpair q] -> Maybe [Int]
+inacc q ps = 
+    let qinpi i = 
+            if even i 
+               then S.member q $ fst $ ps !! (i `div` 2) 
+               else S.member q $ snd $ ps !! (i `div` 2)
+    in case filter qinpi [0 .. 2*(length ps)-1] of
+         [] -> Nothing
+         is -> Just is
+  
+draToHoa :: (Show q, Show l, Ord q) => A.DRA q (Maybe LabelExpr) l
+                                    -> HOA
+draToHoa a =
+    let pairs = A.accept a
+        -- maxpar = maximum $ M.elems parmap 
+        hs = [ NumStates $ S.size (A.states a)
+            , Start $ [(A.toNode a q) - 1 | q <- S.toList (A.start a)]
+            , Tool ["optimized IAR", "v1"]
+            , AcceptanceName $ Rabin $ length pairs
+            , buildDRAacceptance $ length pairs
+            , AP $ fromJust $  A.aps a
+            ]
+        bs = [BodyItem{ stateLabel = Nothing
+                , num = (A.toNode a q) - 1
+                , descr = Nothing
+                , stateAccSig = inacc q pairs --  Just [parmap M.! q] 
+                , edges = [EdgeItem{ edgeLabel = l
+                                , stateConj = [(A.toNode a q') - 1]
+                                , accSig = Nothing
+                                } | (q', l) <- A.succs a q]
+                }
+            | q <- S.toList (A.states a)]
+    in HOA hs bs
+  
 -- | Pretty-print Hoa Format
-toHoa :: ([HeaderItem], [BodyItem]) -> String
-toHoa (hs, bs) = unlines $ ["HOA: v1"] ++
+toHoa :: HOA -> String
+toHoa (HOA hs bs) = unlines $ ["HOA: v1"] ++
                             (headerItemToHoa <$> hs) ++
                             ["--BODY--"] ++
                             [concat (bodyItemToHoa <$> bs) ++ "--END--"]
@@ -416,7 +685,7 @@ accNameToHoa a = case a of
   (GCoBuchi i) -> "generalized-co-Buchi " ++ show i
   (Streett i) -> "Streett " ++ show i
   (Rabin i) -> "Rabin " ++ show i
-  (Parity as b i) -> "Parity " ++ minMaxToHoa as ++ evenOddToHoa b ++ " " ++ show i where
+  (Parity as b i) -> "parity " ++ minMaxToHoa as ++ " " ++ evenOddToHoa b ++ " " ++ show i where
     minMaxToHoa Min = "min"
     minMaxToHoa Max = "max"
     evenOddToHoa Even = "even"
@@ -459,9 +728,9 @@ bodyItemToHoa b = ("State: " ++
 
 embracedBy :: Parser a -> T.Text -> T.Text -> Parser a
 embracedBy p s1 s2 = do
-  skipNonToken $ string s1
+  token s1
   r <- p
-  skipNonToken $ string s2
+  token s2
   return r
 
 
@@ -477,20 +746,22 @@ curls :: Parser a -> Parser a
 curls p = embracedBy p "{" "}"
 
 
-skipNonToken :: Parser a -> Parser a
-skipNonToken p =  do
-  skipSpace
-  many $ do
-    string "/*" *> manyTill anyChar (string "*/")
-    skipSpace
-  p
+-- skipNonToken :: Parser a -> Parser a
+-- skipNonToken p =  whitespace *> p
 
+whitespace :: Parser ()
+whitespace = do
+  skipSpace
+  void $ many $ do
+    DAT.string "/*" *> manyTill anyChar (DAT.string "*/")
+    skipSpace
 
 parseDoubleQuotedString :: Parser T.Text
 parseDoubleQuotedString = do
   char '"'
   x <- many (notChar '\"' <|> (char '\\' >> char '\"'))
   char '"'
+  whitespace
   return $ T.pack x
 
 
@@ -499,6 +770,12 @@ parseIntInRange i = do
   x <- decimal
   guard (x >= 0 && x < i) <?> "Reference out of range."
   return x
+
+decimal :: Parser Int
+decimal = DAT.decimal <* whitespace 
+
+token :: T.Text -> Parser ()
+token s = DAT.string s *> whitespace
 
 
 maybeBlank :: (a -> String) -> Maybe a -> String

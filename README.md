@@ -1,9 +1,8 @@
 omega-automata
 ==============
 
-A Haskell module for processing omega automata
+A Haskell module for processing omega automata (based on [omega-automata 0.1.0.0](https://github.com/stefanjaax/omega-automata))
 
-It currently only supports state-based Büchi automata.
 
 Library features
 ----------------
@@ -12,6 +11,12 @@ Library features
 * Boolean operations (Intersection, Union, Complementation) on Büchi automata
 * Check if a given Büchi automaton is deterministic in the limit
 * Conversion of non-deterministic to limit-deterministic Büchi automaton
+
+Changes:
+* general automaton type (special types: Büchi, Rabin, parity)
+* can parse and print deterministic Rabin automata
+* can parse and print deterministic parity automata (even if the acceptance condition is none, all, Buchi or Rabin 1)
+* transforms HOA edges (implicit and explicit) into labelled edges where in each label each atomic proposition occurs either positive or negative
 
 Programs
 --------
@@ -36,4 +41,10 @@ args:
  -union fname [fname]             Union-LDBA of two LDBAs
 
  All automata must be specified in Hanoi-Omega-Automata format.
+```
+
+Install
+-------
+```
+stack install
 ```

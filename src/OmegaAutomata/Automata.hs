@@ -1,3 +1,4 @@
+{-# LANGUAGE DatatypeContexts, TypeSynonymInstances, FlexibleInstances #-}
 -- | Definition of various kinds of omega automata
 module OmegaAutomata.Automata where
 import qualified Data.Set as S
@@ -5,6 +6,7 @@ import Data.Graph.Inductive
 import qualified Data.Map as M
 import qualified Data.Bimap as B
 import Data.List (groupBy, nub)
+import qualified Data.Text as T hiding (groupBy, map, head, concat, length, zip, minimum)
 
 type State = Int
 
@@ -12,13 +14,43 @@ data Rank = Rank Int | Bot deriving (Eq, Ord, Show)
 
 type Ranking q = M.Map q Rank
 
+data Automat q a l acc = 
+    Automat { states :: S.Set q       -- ^ The states of the Automaton
+            , bimap :: B.Bimap q Node -- ^ Bijection between states and nodes in the graph
+            , graph :: Gr l a         -- ^ The internal graph representing transitions
+            , start :: S.Set q        -- ^ The initial states in the Automaton
+            , accept :: acc -- ^ The set of accepting states in the NBA
+            , aps :: ! (Maybe [T.Text])
+            } deriving (Show, Eq)
+
+
 -- | Data-type for non-deterministic Buchi automata
-data NBA q a l = NBA{ states :: S.Set q       -- ^ The states of the NBA
-                    , bimap :: B.Bimap q Node -- ^ Bijection between states and nodes in the graph
-                    , graph :: Gr l a         -- ^ The internal graph representing transitions
-                    , start :: S.Set q        -- ^ The initial states in the NBA
-                    , accept :: S.Set q       -- ^ The set of accepting states in the NBA
-                    } deriving (Show)
+class Acceptance acc where
+    size :: acc -> Int
+
+type NBA q a l = Automat q a l (S.Set q)
+instance Acceptance (S.Set q) where
+    size = S.size
+
+
+data ParityAccept q = 
+      MinEv {priomap :: M.Map q Int} 
+    | MinOdd {priomap :: M.Map q Int} 
+    | MaxEv {priomap :: M.Map q Int} 
+    | MaxOdd {priomap :: M.Map q Int} 
+    deriving (Eq, Show)
+type DPA q a l = Automat q a l (ParityAccept q) 
+
+instance Acceptance (ParityAccept q) where
+    size acc = S.size $ S.fromList $ M.elems $ priomap acc
+    
+
+type Rabinpair q = (S.Set q, S.Set q)
+type DRA q a l = Automat q a l [Rabinpair q]
+
+instance Acceptance [Rabinpair q] where
+    size = foldl (\i (e,f) -> i + 1 + S.size e + S.size f) 0
+
 
 -- | State-data type used in the complement-construction
 data (Ord q) => CompState q = PowerState [q] | RankState (Ranking q, [q]) deriving Show
@@ -39,31 +71,31 @@ instance (Ord q) => Ord (CompState q) where
 
 
 -- | Returns node in internal graph corresponding to state
-toNode :: (Ord q) => NBA q a l -> q -> Node
+toNode :: (Ord q) => Automat q a l acc -> q -> Node
 toNode a q = (bimap a) B.! q
 
 
 -- | Returns state corresponding to node in internal graph
-toState :: (Ord q) => NBA q a l -> Node -> q
+toState :: (Ord q) => Automat q a l acc -> Node -> q
 toState a q = (bimap a) B.!> q
 
 
 -- | Returns successors of state with corresponding edge-labels
-succs :: (Ord q) => NBA q a l   -- ^ The NBA the state belongs to
+succs :: (Ord q) => Automat q a l acc   -- ^ The NBA the state belongs to
                  -> q           -- ^ The state
                  -> [(q, a)]    -- ^ Successor states and corresponding edge-label.
 succs a q = (\(q', l) -> (toState a q', l)) <$> lsuc (graph a) (toNode a q)
 
 
 -- | Returns predecessors of state with corresponding edge-labels
-pres :: (Ord q) => NBA q a l    -- ^ The NBA the state belongs to
+pres :: (Ord q) => Automat q a l acc    -- ^ The NBA the state belongs to
                 -> q            -- ^ The state
                 -> [(q, a)]     -- ^ Predecessors and corresponding edge-label.
 pres a q = (\(q', l) -> (toState a q', l)) <$> lpre (graph a) (toNode a q)
 
 
 -- | Returns list of successor-states for a given state and edge-label
-aSuccs :: (Ord q, Eq a) => NBA q a l   -- ^ The NBA the state belongs to
+aSuccs :: (Ord q, Eq a) => Automat q a l  acc  -- ^ The NBA the state belongs to
                         -> q           -- ^ The state
                         -> a           -- ^ The edge-label
                         -> [q]         -- ^ List of successors for state and edge-label.
@@ -71,7 +103,7 @@ aSuccs a q b = [toState a q' | (q', b') <- lsuc (graph a) (toNode a q), b' == b]
 
 
 -- | Returns list of predecessor-states for a given state and edge-label
-aPres :: (Ord q, Eq a) => NBA q a l   -- ^ The NBA the state belongs to
+aPres :: (Ord q, Eq a) => Automat q a l acc   -- ^ The NBA the state belongs to
                        -> q           -- ^ The state
                        -> a           -- ^ The edge-label
                        -> [q]         -- ^ List of predecessors for state and edge-label.
@@ -79,7 +111,7 @@ aPres a q b = [toState a q' | (q', b') <- lpre (graph a) (toNode a q), b' == b]
 
 
 -- | Returns all labelled transitions defined in a given NBA
-trans :: (Ord q) => NBA q a l     -- ^ The NBA
+trans :: (Ord q) => Automat q a l acc     -- ^ The NBA
                  -> [(q, a, q)]   -- ^ List of labelled transitions defined in NBA
 trans a = [(q1, l, q2) | (i1, i2, l) <- labEdges (graph a)
                        , let q1 = (bimap a) B.!> i1
@@ -95,12 +127,12 @@ combine xs = let xs' = groupBy (\x y -> snd x == snd y) xs in
 
 
 -- | Lifts successor-relation of a state to successor-relation of lists of states
-powerSucc :: (Eq a, Ord q) => NBA q a l -> [q] -> [([q], a)]
+powerSucc :: (Eq a, Ord q) => Automat q a l acc -> [q] -> [([q], a)]
 powerSucc a qs = map (\(xs, l) -> (nub xs, l)) $ combine $ concat [succs a q | q <- qs]
 
 
 -- | Same as 'powerSucc', only for distinct symbol
-powerASucc :: (Ord a, Ord q) => NBA q a l -> [q] -> a -> [q]
+powerASucc :: (Ord a, Ord q) => Automat q a l acc -> [q] -> a -> [q]
 powerASucc a qs l = concat [aSuccs a q l | q <- qs]
 
 
@@ -109,43 +141,45 @@ annotateStates :: (Ord q, Ord i) => i                 -- ^ The value used for an
                                  -> NBA q a l         -- ^ The original NBA
                                  -> NBA (i, q) a l    -- ^ The annotated NBA
 annotateStates i a = let annotate = S.map (\x -> (i, x)) in
-                      NBA{ states = annotate (states a)
+                      Automat{ states = annotate (states a)
                          , bimap = B.fromList [((i, q), n) | (q, n) <- (B.assocs (bimap a))]
                          , graph = graph a
                          , start = annotate (start a)
                          , accept = annotate (accept a)
+                         , aps = aps a
                          }
 
 
 -- | Inserts states into an NBA
 insertStates :: (Ord q) => [(q, l)]     -- ^ List of labelled states to be inserted
-                        -> NBA q a l    -- ^ The original NBA
-                        -> NBA q a l    -- ^ The NBA resulting from inserting states
+                        -> Automat q a l acc   -- ^ The original NBA
+                        -> Automat q a l acc    -- ^ The NBA resulting from inserting states
 insertStates qls a = let qs = fst <$> qls
                          ls = snd <$> qls
                          newNs = newNodes (length qs) (graph a)
                          newBimap = B.fromList (B.assocs (bimap a) ++ zip qs newNs) in
-                          NBA{ states = S.union (states a) (S.fromList qs)
+                          Automat{ states = S.union (states a) (S.fromList qs)
                              , bimap = newBimap
                              , graph = insNodes (zip newNs ls) (graph a)
                              , start = start a
                              , accept = accept a
+                             , aps = aps a
                              }
 
 
 -- | Returns list of edge-labels defined in an NBA
-alphabet :: (Eq a) => NBA q a l   -- ^ The NBA
+alphabet :: (Eq a) => Automat q a l acc  -- ^ The NBA
                    -> [a]         -- ^ List of edge-labels defined in NBA
 alphabet a =  nub $ edgeLabel <$> labEdges (graph a)
 
 
-graphNodes :: NBA q a l -> [Node]
+graphNodes :: Automat q a l acc -> [Node]
 graphNodes a = nodes (graph a)
 
 
 -- | Returns label of a state in an NBA
 label :: (Ord q) => q           -- The state
-                 -> NBA q a l   -- The NBA the state is contained in
+                 -> Automat q a l acc   -- The NBA the state is contained in
                  -> l           -- The label of the state
 label q a = let l = lab (graph a) (bimap a B.! q) in
   case l of
@@ -155,13 +189,19 @@ label q a = let l = lab (graph a) (bimap a B.! q) in
 
 -- | Inserts transitions into NBA.
 insertTrans :: (Ord q) => [(q, a, q)]  -- ^ List of transitions
-                       -> NBA q a l    -- ^ The original NBA
-                       -> NBA q a l    -- ^ The NBA resulting from inserting the transitions
+                       -> Automat q a l acc   -- ^ The original NBA
+                       -> Automat q a l acc   -- ^ The NBA resulting from inserting the transitions
 insertTrans ts a = let es = [(i1, i2, l) | (q1, l, q2) <- ts
                                          , let i1 = bimap a B.! q1
                                          , let i2 = bimap a B.! q2] in
                         a{graph = insEdges es (graph a)}
 
+-- | scc decomposition of graph
+scc_nodes :: Automat q a l acc -> [[Node]]
+scc_nodes a = scc $ graph a
+
+scc_states :: Ord q => Automat q a l acc -> [[q]]
+scc_states a = ( toState a <$> ) <$> scc_nodes a
 
 -- | Returns union of two Buchi automata.
 -- | If the automata are limit-deterministic theb so is the returned automaton.
@@ -248,20 +288,28 @@ reduceAutomaton a = let (qs, newTs) = transClosure (S.toList (start a)) (succs a
   makeNBA newStates newTs newStart newAcc
 
 
--- | Constructs an NBA from components
+makeAutomat :: (Ord q) => [(q, l)]           -- ^ List of labelled states
+                   -> [(q, a, q)]        -- ^ List of labelled transitions
+                   -> [q]                -- ^ List of start-states
+                   -> acc                -- ^ List of accepting states
+                   -> Automat q a l acc         -- ^ The resulting NBA
+makeAutomat qs ts ss as = 
+    let lNodes = zip [1..] (snd <$> qs)
+        assoc = zip (fst <$> qs) [1..] in
+        insertTrans ts $ Automat{ states = S.fromList [q | (q, _) <- qs]
+                                , graph = mkGraph lNodes []
+                                , bimap = B.fromList assoc
+                                , start = S.fromList ss
+                                , accept = as
+                                , aps = Nothing
+                                }
+
 makeNBA :: (Ord q) => [(q, l)]           -- ^ List of labelled states
                    -> [(q, a, q)]        -- ^ List of labelled transitions
                    -> [q]                -- ^ List of start-states
                    -> [q]                -- ^ List of accepting states
                    -> NBA q a l          -- ^ The resulting NBA
-makeNBA qs ts ss as = let lNodes = zip [1..] (snd <$> qs)
-                          assoc = zip (fst <$> qs) [1..] in
-                           insertTrans ts $ NBA{ states = S.fromList [q | (q, _) <- qs]
-                                               , graph = mkGraph lNodes []
-                                               , bimap = B.fromList assoc
-                                               , start = S.fromList ss
-                                               , accept = S.fromList as
-                                               }
+makeNBA qs ts ss as = makeAutomat qs ts ss (S.fromList as)
 
 
 isEven :: Rank -> Bool

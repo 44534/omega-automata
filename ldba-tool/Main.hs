@@ -13,20 +13,20 @@ main :: IO ()
 main = getArgs >>= actionsForArgs
 
 
-printHoa :: (Ord q, Show q, Show l) => ([HeaderItem], [BodyItem])
+printHoa :: (Ord q, Show q, Show l) => HOA
                     -> NBA q (Maybe LabelExpr) l
                     -> IO ()
-printHoa (hs, _) automaton = let
-  props = [AP b | (AP b) <- hs]
-  (hs', bs) = nbaToHoa automaton in
-    putStr $ toHoa (props ++ hs', bs)
+printHoa hoa automaton = do
+  let props = [AP b | (AP b) <- header hoa]
+      hoa = nbaToHoa automaton
+  putStr $ toHoa $ addProps props hoa
 
 
-parseHoaOrExit :: T.Text -> IO ([HeaderItem], [BodyItem])
+parseHoaOrExit :: T.Text -> IO HOA
 parseHoaOrExit s = do
   let p = parseOnly parseHoa s
   case p of
-    (Right (hs, bs)) -> return (hs, bs)
+    (Right hoa) -> return hoa
     _ -> putStrLn "An error occured during parsing of HOA input." >> die'
 
 
