@@ -1,5 +1,6 @@
 omega-automata
 ==============
+[![Build Status](https://travis-ci.org/44534/omega-automata.svg?branch=master)](https://travis-ci.org/44534/omega-automata)
 
 A Haskell module for processing omega automata (based on [omega-automata 0.1.0.0](https://github.com/stefanjaax/omega-automata))
 
